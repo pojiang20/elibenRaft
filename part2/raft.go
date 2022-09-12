@@ -80,6 +80,29 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("AppendEntries: %+v", args)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in AppendEntries")
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+
+	}
+}
+
 func (cm *ConsensusModule) becomeFollower(term int) {
 	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
