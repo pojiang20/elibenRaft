@@ -100,6 +100,36 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		}
 		cm.electionResetEvent = time.Now()
 
+		if args.PrevLogIndex == -1 ||
+			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
+			reply.Success = true
+
+			logInsertIndex := args.PrevLogIndex + 1
+			newEntriesIndex := 0
+
+			for {
+				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
+					break
+				}
+				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
+					break
+				}
+				logInsertIndex++
+				newEntriesIndex++
+			}
+
+			if newEntriesIndex < len(args.Entries) {
+				cm.dlog("... inserting entries %v frin ubdex %d", args.Entries[newEntriesIndex:], logInsertIndex)
+				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
+				cm.dlog("... log is now: %v", cm.log)
+			}
+
+			if args.LeaderCommit > cm.commitIndex {
+				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
+				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
+				cm.newCommitReadyChan <- struct{}{}
+			}
+		}
 	}
 }
 
@@ -352,6 +382,36 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	}
 }
 
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFOr=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	if cm.currentTerm == args.Term &&
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+	reply.Term = cm.currentTerm
+	cm.dlog("... RequestVote reply: %+v", reply)
+	return nil
+}
+
 func (cm *ConsensusModule) commitChanSender() {
 	for range cm.newCommitReadyChan {
 		cm.mu.Lock()
@@ -383,4 +443,11 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+func intMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
