@@ -80,6 +80,7 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// Follower来追加日志
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -131,6 +132,10 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			}
 		}
 	}
+
+	reply.Term = cm.currentTerm
+	cm.dlog("AppendEntries reply: %+v", *reply)
+	return nil
 }
 
 func (cm *ConsensusModule) becomeFollower(term int) {
@@ -225,6 +230,37 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+// 投票操作
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Dead {
+		return nil
+	}
+	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFOr=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	if cm.currentTerm == args.Term &&
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
+		(args.LastLogTerm > lastLogTerm ||
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+	reply.Term = cm.currentTerm
+	cm.dlog("... RequestVote reply: %+v", reply)
+	return nil
+}
+
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
@@ -289,9 +325,36 @@ func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	}
 }
 
-func NewConsensusModule() *ConsensusModule {
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
 	cm := new(ConsensusModule)
+	cm.id = id
+	cm.peerIds = peerIds
+	cm.server = server
+	cm.commitChan = commitChan
+	cm.newCommitReadyChan = make(chan struct{}, 16)
+	cm.state = Follower
+	cm.votedFor = -1
+	cm.commitIndex = -1
+	cm.lastApplied = -1
+	cm.nextIndex = make(map[int]int)
+	cm.matchIndex = make(map[int]int)
+
+	go func() {
+		<-ready
+		cm.mu.Lock()
+		cm.electionResetEvent = time.Now()
+		cm.mu.Unlock()
+		cm.runElectionTimer()
+	}()
+
+	go cm.commitChanSender()
 	return cm
+}
+
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
 }
 
 func (cm *ConsensusModule) Submit(command interface{}) bool {
@@ -307,8 +370,20 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 	return false
 }
 
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = Dead
+	cm.dlog("becomes Dead")
+	close(cm.newCommitReadyChan)
+}
+
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
 	savedCurrentTerm := cm.currentTerm
 	cm.mu.Unlock()
 
@@ -380,36 +455,6 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 			}
 		}(peerId)
 	}
-}
-
-func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if cm.state == Dead {
-		return nil
-	}
-	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFOr=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
-
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in RequestVote")
-		cm.becomeFollower(args.Term)
-	}
-
-	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
-		(args.LastLogTerm > lastLogTerm ||
-			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
-		reply.VoteGranted = true
-		cm.votedFor = args.CandidateId
-		cm.electionResetEvent = time.Now()
-	} else {
-		reply.VoteGranted = false
-	}
-	reply.Term = cm.currentTerm
-	cm.dlog("... RequestVote reply: %+v", reply)
-	return nil
 }
 
 func (cm *ConsensusModule) commitChanSender() {
