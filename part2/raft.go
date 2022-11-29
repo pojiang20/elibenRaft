@@ -62,6 +62,8 @@ type ConsensusModule struct {
 
 	//主与从id的相同位置是nextIndex[peerId]-1，也就是nextIndex指示了主从同步后带插入的位置
 	nextIndex map[int]int
+	//当选leader后，commitIndex指向已经确认的日志位置
+	commitIndex int
 }
 
 // NewConsensusModule creates a new CM with the given ID, list of peer IDs and
@@ -294,14 +296,35 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 					cm.becomeFollower(reply.Term)
 					return
 				}
-				//如果从节点返回错误，需要回退相同坐标
-				//如果从节点返回正确，表示通过一致性检测并且已经同步坐标
-				if !reply.Success {
-					//lastSameLogIndex是相同位置，+1是即将插入，-1是即将插入回退
-					cm.nextIndex[peerId] = (lastSameLogIndex + 1) - 1
-				} else {
-					//更新nextIndex
-					cm.nextIndex[peerId] = lastSameLogIndex + len(entriesL2F) + 1
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					//如果从节点返回错误，需要回退相同坐标
+					//如果从节点返回正确，表示通过一致性检测并且已经同步坐标
+					if !reply.Success {
+						//lastSameLogIndex是相同位置，+1是即将插入，-1是即将插入回退
+						cm.nextIndex[peerId] = (lastSameLogIndex + 1) - 1
+					} else {
+						//更新nextIndex
+						cm.nextIndex[peerId] = lastSameLogIndex + len(entriesL2F) + 1
+
+						//进行第二个阶段，对majority进行commit
+						savedCommitIndex := cm.commitIndex
+						//查看commitIndex后续所有日志的同步情况
+						for needCommitIndex := savedCommitIndex + 1; needCommitIndex < len(cm.log); needCommitIndex++ {
+							//QA 为什么需要是相同的任期
+							if cm.log[needCommitIndex].Term == cm.currentTerm {
+								//统计数量
+								count := 1
+								for _, peerId := range cm.peerIds {
+									if cm.nextIndex[peerId] >= needCommitIndex {
+										count++
+									}
+								}
+								if count*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = needCommitIndex
+								}
+							}
+						}
+					}
 				}
 			}
 			cm.mu.Unlock()
