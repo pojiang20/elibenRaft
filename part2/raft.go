@@ -59,6 +59,9 @@ type ConsensusModule struct {
 	//QA 这里的volatile是字段的可见性？？
 	state              CMState
 	electionResetEvent time.Time
+
+	//主与从id的相同位置是nextIndex[peerId]-1，也就是nextIndex指示了主从同步后带插入的位置
+	nextIndex map[int]int
 }
 
 // NewConsensusModule creates a new CM with the given ID, list of peer IDs and
@@ -86,6 +89,23 @@ func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan inte
 	}()
 
 	return cm
+}
+
+// 对外提供的提交command的接口，只对leader有效
+func (cm *ConsensusModule) Submit(cmd interface{}) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Leader {
+		item := LogEntry{
+			cmd,
+			cm.currentTerm,
+		}
+		//Propose阶段：将日志追加到本地
+		cm.log = append(cm.log, item)
+		return true
+	}
+	return false
 }
 
 func (cm *ConsensusModule) electionTimeout() time.Duration {
@@ -147,7 +167,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
-	//QA 为什么要有savedTerm，难道currentTerm在执行过程中会发生变化？
+	//QA 为什么要有savedTerm，难道currentTerm在执行过程中会发生变化？确实在发送过程中任期可能发生变化，使用savedTerm保证所有消息任期相同
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
@@ -236,8 +256,8 @@ func (cm *ConsensusModule) startLeader() {
 	}()
 }
 
-// leaderSendHeartbeats sends a round of heartbeats to all peers, collects their
-// replies and adjusts cm's state.
+// 原来发送心跳只是为了与Follower建立连接且重置定时器
+// 现在发送心跳还用于追加统一日志
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
 	if cm.state != Leader {
@@ -248,24 +268,43 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Unlock()
 
 	for _, peerId := range cm.peerIds {
-		args := AppendEntriesArgs{
-			Term:     savedCurrentTerm,
-			LeaderId: cm.id,
-		}
-
 		go func(peerId int) {
+			cm.mu.Lock()
+			lastSameLogIndex := cm.nextIndex[peerId] - 1
+			lastSameLogTerm := -1
+			if lastSameLogIndex >= 0 {
+				lastSameLogTerm = cm.log[lastSameLogIndex].Term
+			}
+			//主将相同日志后的所有内容都追加给从
+			entriesL2F := cm.log[lastSameLogIndex+1:]
+
+			args := AppendEntriesArgs{
+				Term:             savedCurrentTerm,
+				LeaderId:         cm.id,
+				LastSameLogIndex: lastSameLogIndex,
+				LastSameLogTerm:  lastSameLogTerm,
+				Entries:          entriesL2F,
+			}
 			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				//这里的defer不受扩号的作用域影响
-				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
 					cm.dlog("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
 				}
+				//如果从节点返回错误，需要回退相同坐标
+				//如果从节点返回正确，表示通过一致性检测并且已经同步坐标
+				if !reply.Success {
+					//lastSameLogIndex是相同位置，+1是即将插入，-1是即将插入回退
+					cm.nextIndex[peerId] = (lastSameLogIndex + 1) - 1
+				} else {
+					//更新nextIndex
+					cm.nextIndex[peerId] = lastSameLogIndex + len(entriesL2F) + 1
+				}
 			}
+			cm.mu.Unlock()
 		}(peerId)
 	}
 }
@@ -274,10 +313,10 @@ type AppendEntriesArgs struct {
 	Term     int
 	LeaderId int
 
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
+	LastSameLogIndex int
+	LastSameLogTerm  int
+	Entries          []LogEntry
+	LeaderCommit     int
 }
 
 type AppendEntriesReply struct {
@@ -285,6 +324,7 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// 为什么不需要Index
 type LogEntry struct {
 	Command interface{}
 	Term    int
