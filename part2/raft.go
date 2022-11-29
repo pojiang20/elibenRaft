@@ -11,6 +11,12 @@ import (
 
 const DebugCM = 1
 
+type CommitEntry struct {
+	Command interface{}
+	Index   int
+	Term    int
+}
+
 type CMState int
 
 const (
@@ -60,10 +66,18 @@ type ConsensusModule struct {
 	state              CMState
 	electionResetEvent time.Time
 
+	//用于触发commit更新后，发聩给client的操作
+	newCommitReadyChan chan struct{}
+
 	//主与从id的相同位置是nextIndex[peerId]-1，也就是nextIndex指示了主从同步后带插入的位置
 	nextIndex map[int]int
 	//当选leader后，commitIndex指向已经确认的日志位置
 	commitIndex int
+
+	//记录提交给client的坐标
+	lastApplied int
+	//client通过这个通道知道commit内容
+	commitChan chan<- CommitEntry
 }
 
 // NewConsensusModule creates a new CM with the given ID, list of peer IDs and
@@ -324,11 +338,38 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 								}
 							}
 						}
+						//commitIndex更新后，需要进行消息同步
+						if cm.commitIndex != savedCommitIndex {
+							cm.newCommitReadyChan <- struct{}{}
+						}
 					}
 				}
 			}
 			cm.mu.Unlock()
 		}(peerId)
+	}
+}
+
+// 独立协程负责反馈commit,即返回lastApplied到commit这段内容全部返回
+func (cm *ConsensusModule) commitChanSender() {
+	for range cm.newCommitReadyChan {
+		cm.mu.Lock()
+		savedTerm := cm.currentTerm
+		savedLastApplied := cm.lastApplied
+		var entries []LogEntry
+		if cm.commitIndex > savedLastApplied {
+			entries = cm.log[savedLastApplied:cm.commitIndex]
+			cm.lastApplied = cm.commitIndex
+		}
+		cm.mu.Unlock()
+
+		for i, entry := range entries {
+			cm.commitChan <- CommitEntry{
+				Command: entry.Command,
+				Index:   savedLastApplied + i + 1,
+				Term:    savedTerm,
+			}
+		}
 	}
 }
 
