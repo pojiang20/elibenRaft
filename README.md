@@ -7,8 +7,9 @@ https://eli.thegreenplace.net/2020/implementing-raft-part-0-introduction/
 
 2022-09-14 22:06:40 进行到part3优化部分暂停 
 
-
 2022-11-04 18:19:09 part1重写
+
+2022-11-16 21:06:36 part2重写
 
 ### 笔记
 #### 如果一个节点离线，一段时间后再上线会发生什么？
