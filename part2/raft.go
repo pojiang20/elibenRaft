@@ -11,13 +11,10 @@ import (
 
 const DebugCM = 1
 
-// client means service
 type CommitEntry struct {
 	Command interface{}
-
-	Index int
-
-	Term int
+	Index   int
+	Term    int
 }
 
 type CMState int
@@ -29,154 +26,107 @@ const (
 	Dead
 )
 
-type LogEntry struct {
-	Command interface{}
-	Term    int
+// 把枚举值转换成字符串
+func (s CMState) String() string {
+	switch s {
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	case Leader:
+		return "Leader"
+	case Dead:
+		return "Dead"
+	default:
+		panic("unreachable")
+	}
 }
 
+// ConsensusModule implements a single node of Raft consensus.
 type ConsensusModule struct {
+	//mu对cm的并发访问提供保护
 	mu sync.Mutex
 
-	//cm模快的服务器id
+	//服务ID
 	id int
 
+	//集群中其他节点的id
 	peerIds []int
 
+	//给其他同辈发送RPC请求
 	server *Server
 
-	commitChan chan<- CommitEntry
-
-	newCommitReadyChan chan struct{}
-
-	//在所有服务之间持久化raft状态
-	log         []LogEntry
+	//持久化的raft状态
 	currentTerm int
 	votedFor    int
+	log         []LogEntry
 
-	//volatile raft state on all servers
-	commitIndex        int
+	//Volatile Raft state on all servers
+	//QA 这里的volatile是字段的可见性？？
 	state              CMState
 	electionResetEvent time.Time
-	lastApplied        int
 
-	//volatile raft state on leaders
-	//nextIndex保存了节点到其他peers要追加新内容的坐标
-	nextIndex  map[int]int
-	matchIndex map[int]int
+	//用于触发commit更新后，发聩给client的操作
+	newCommitReadyChan chan struct{}
+
+	//主与从id的相同位置是nextIndex[peerId]-1，也就是nextIndex指示了主从同步后带插入的位置
+	nextIndex map[int]int
+	//当选leader后，commitIndex指向已经确认的日志位置
+	commitIndex int
+
+	//记录提交给client的坐标
+	lastApplied int
+	//client通过这个通道知道commit内容
+	commitChan chan<- CommitEntry
 }
 
-type AppendEntriesArgs struct {
-	Term     int
-	LeaderId int
-
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-// Follower来追加日志
-func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	if cm.state == Dead {
-		return nil
-	}
-	cm.dlog("AppendEntries: %+v", args)
-
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in AppendEntries")
-		cm.becomeFollower(args.Term)
-	}
-
-	reply.Success = false
-	if args.Term == cm.currentTerm {
-		if cm.state != Follower {
-			cm.becomeFollower(args.Term)
-		}
-		cm.electionResetEvent = time.Now()
-
-		if args.PrevLogIndex == -1 ||
-			(args.PrevLogIndex < len(cm.log) && args.PrevLogTerm == cm.log[args.PrevLogIndex].Term) {
-			reply.Success = true
-
-			logInsertIndex := args.PrevLogIndex + 1
-			newEntriesIndex := 0
-
-			for {
-				if logInsertIndex >= len(cm.log) || newEntriesIndex >= len(args.Entries) {
-					break
-				}
-				if cm.log[logInsertIndex].Term != args.Entries[newEntriesIndex].Term {
-					break
-				}
-				logInsertIndex++
-				newEntriesIndex++
-			}
-
-			if newEntriesIndex < len(args.Entries) {
-				cm.dlog("... inserting entries %v frin ubdex %d", args.Entries[newEntriesIndex:], logInsertIndex)
-				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
-				cm.dlog("... log is now: %v", cm.log)
-			}
-
-			if args.LeaderCommit > cm.commitIndex {
-				cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
-				cm.dlog("... setting commitIndex=%d", cm.commitIndex)
-				cm.newCommitReadyChan <- struct{}{}
-			}
-		}
-	}
-
-	reply.Term = cm.currentTerm
-	cm.dlog("AppendEntries reply: %+v", *reply)
-	return nil
-}
-
-func (cm *ConsensusModule) becomeFollower(term int) {
-	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
+// NewConsensusModule creates a new CM with the given ID, list of peer IDs and
+// server. The ready channel signals the CM that all peers are connected and
+// it's safe to start its state machine.
+// 创建一个节点，并分配id
+func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}) *ConsensusModule {
+	cm := new(ConsensusModule)
+	cm.id = id
+	cm.peerIds = peerIds
+	cm.server = server
 	cm.state = Follower
-	cm.currentTerm = term
 	cm.votedFor = -1
-	cm.electionResetEvent = time.Now()
-
-	go cm.runElectionTimer()
-}
-
-func (cm *ConsensusModule) startLeader() {
-	cm.state = Leader
-
-	//初始化nextIndex，都为最新Log的index的下一个位置
-	for _, peerId := range cm.peerIds {
-		cm.nextIndex[peerId] = len(cm.log)
-		cm.matchIndex[peerId] = -1
-	}
-	cm.dlog("becomes Leader; term=%d, nextIndex=%v, matchIndex=%v; log=%v", cm.currentTerm, cm.nextIndex, cm.log)
 
 	go func() {
-		ticker := time.NewTicker(50 * time.Millisecond)
-		defer ticker.Stop()
-
-		for {
-			cm.leaderSendHeartbeats()
-			<-ticker.C
-
-			cm.mu.Lock()
-			if cm.state != Leader {
-				cm.mu.Unlock()
-				return
-			}
-			cm.mu.Unlock()
-		}
+		// The CM is quiescent until ready is signaled; then, it starts a countdown
+		// for leader election.
+		// 这个协程是静止的，直到接收到信号量，然后开启选举倒计时。
+		//TODO 它何时会被触发？
+		<-ready
+		cm.mu.Lock()
+		cm.electionResetEvent = time.Now()
+		cm.mu.Unlock()
+		cm.runElectionTimer()
 	}()
+
+	return cm
+}
+
+// 对外提供的提交command的接口，只对leader有效
+func (cm *ConsensusModule) Submit(cmd interface{}) bool {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if cm.state == Leader {
+		item := LogEntry{
+			cmd,
+			cm.currentTerm,
+		}
+		//Propose阶段：将日志追加到本地
+		cm.log = append(cm.log, item)
+		return true
+	}
+	return false
 }
 
 func (cm *ConsensusModule) electionTimeout() time.Duration {
+	//如果设置了RAFT_FORCE_MORE_REELECTION，则表示有意进行压力测试
+	//通过使用一个硬编码来产生碰撞，在不同的服务器之间强制进行更多的重新选举
 	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
 		return time.Duration(150) * time.Millisecond
 	} else {
@@ -184,6 +134,12 @@ func (cm *ConsensusModule) electionTimeout() time.Duration {
 	}
 }
 
+// runElectionTimer implements an election timer. It should be launched whenever
+// we want to start a timer towards becoming a candidate in a new election.
+//
+// This function is blocking and should be launched in a separate goroutine;
+// it's designed to work for a single (one-shot) election timer, as it exits
+// whenever the CM state changes from follower/candidate or the term changes.
 func (cm *ConsensusModule) runElectionTimer() {
 	timeoutDuration := cm.electionTimeout()
 	cm.mu.Lock()
@@ -204,11 +160,14 @@ func (cm *ConsensusModule) runElectionTimer() {
 		}
 
 		if termStarted != cm.currentTerm {
-			cm.dlog("in election timer term changed from %d to %d,bailing out", termStarted, cm.currentTerm)
+			cm.dlog("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
 			return
 		}
 
+		//Start an election if we haven't heard from a leader or
+		//haven't voted for someone for the duration of the timeout.
+		//QA 计时期间没有给别人投票也会重新发起投票？这是对应分裂投票的情况吗？
 		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeoutDuration {
 			cm.startElection()
 			cm.mu.Unlock()
@@ -218,52 +177,13 @@ func (cm *ConsensusModule) runElectionTimer() {
 	}
 }
 
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-// 投票操作
-func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	if cm.state == Dead {
-		return nil
-	}
-	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFOr=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
-
-	if args.Term > cm.currentTerm {
-		cm.dlog("... term out of date in RequestVote")
-		cm.becomeFollower(args.Term)
-	}
-
-	if cm.currentTerm == args.Term &&
-		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) &&
-		(args.LastLogTerm > lastLogTerm ||
-			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) {
-		reply.VoteGranted = true
-		cm.votedFor = args.CandidateId
-		cm.electionResetEvent = time.Now()
-	} else {
-		reply.VoteGranted = false
-	}
-	reply.Term = cm.currentTerm
-	cm.dlog("... RequestVote reply: %+v", reply)
-	return nil
-}
-
+// startElection starts a new election with this CM as a candidate.
+// Expects cm.mu to be locked.
+// 当前cm节点作为候选人发起选举
 func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
+	//QA 为什么要有savedTerm，难道currentTerm在执行过程中会发生变化？确实在发送过程中任期可能发生变化，使用savedTerm保证所有消息任期相同
 	savedCurrentTerm := cm.currentTerm
 	cm.electionResetEvent = time.Now()
 	cm.votedFor = cm.id
@@ -271,21 +191,17 @@ func (cm *ConsensusModule) startElection() {
 
 	votesReceived := 1
 
+	// Send RequestVote RPCs to all other servers concurrently.
+	//给所有其他节点发送RPC请求
 	for _, peerId := range cm.peerIds {
 		go func(peerId int) {
-			cm.mu.Lock()
-			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
-			cm.mu.Unlock()
-
 			args := RequestVoteArgs{
-				Term:         savedLastLogTerm,
-				CandidateId:  cm.id,
-				LastLogIndex: savedLastLogIndex,
-				LastLogTerm:  savedCurrentTerm,
+				Term:        savedCurrentTerm,
+				CandidateId: cm.id,
 			}
+			var reply RequestVoteReply
 
 			cm.dlog("sending RequestVote to %d: %+v", peerId, args)
-			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
@@ -297,13 +213,15 @@ func (cm *ConsensusModule) startElection() {
 				}
 
 				if reply.Term > savedCurrentTerm {
-					cm.dlog("term out of date in RequestVoteRely")
+					cm.dlog("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == savedCurrentTerm {
+					//QA 为什么不要判断投给了谁？
 					if reply.VoteGranted {
 						votesReceived += 1
 						if votesReceived*2 > len(cm.peerIds)+1 {
+							// Won the election!
 							cm.dlog("wins election with %d votes", votesReceived)
 							cm.startLeader()
 							return
@@ -313,71 +231,49 @@ func (cm *ConsensusModule) startElection() {
 			}
 		}(peerId)
 	}
+
+	//候选人状态的计时器，如果这轮没有选出Leader，则重新发起投票
+	go cm.runElectionTimer()
 }
 
-// 当前server的lastIndex、Term
-func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
-	if len(cm.log) > 0 {
-		lastIndex := len(cm.log) - 1
-		return lastIndex, cm.log[lastIndex].Term
-	} else {
-		return -1, -1
-	}
-}
-
-func NewConsensusModule(id int, peerIds []int, server *Server, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
-	cm := new(ConsensusModule)
-	cm.id = id
-	cm.peerIds = peerIds
-	cm.server = server
-	cm.commitChan = commitChan
-	cm.newCommitReadyChan = make(chan struct{}, 16)
+// becomeFollower makes cm a follower and resets its state.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) becomeFollower(term int) {
+	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
 	cm.state = Follower
+	cm.currentTerm = term
 	cm.votedFor = -1
-	cm.commitIndex = -1
-	cm.lastApplied = -1
-	cm.nextIndex = make(map[int]int)
-	cm.matchIndex = make(map[int]int)
+	cm.electionResetEvent = time.Now()
+
+	go cm.runElectionTimer()
+}
+
+// startLeader switches cm into a leader state and begins process of heartbeats.
+// Expects cm.mu to be locked.
+func (cm *ConsensusModule) startLeader() {
+	cm.state = Leader
+	cm.dlog("becomes Leader; term=%d, log=%v", cm.currentTerm, cm.log)
 
 	go func() {
-		<-ready
-		cm.mu.Lock()
-		cm.electionResetEvent = time.Now()
-		cm.mu.Unlock()
-		cm.runElectionTimer()
+		ticker := time.NewTicker(50 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			cm.leaderSendHeartbeats()
+			<-ticker.C
+
+			cm.mu.Lock()
+			if cm.state != Leader {
+				cm.mu.Unlock()
+				return
+			}
+			cm.mu.Unlock()
+		}
 	}()
-
-	go cm.commitChanSender()
-	return cm
 }
 
-func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	return cm.id, cm.currentTerm, cm.state == Leader
-}
-
-func (cm *ConsensusModule) Submit(command interface{}) bool {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
-	cm.dlog("Submit received by %v: %v", cm.state, command)
-	if cm.state == Leader {
-		cm.log = append(cm.log, LogEntry{Command: command, Term: cm.currentTerm})
-		cm.dlog("... log=%v", cm.log)
-		return true
-	}
-	return false
-}
-
-func (cm *ConsensusModule) Stop() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-	cm.state = Dead
-	cm.dlog("becomes Dead")
-	close(cm.newCommitReadyChan)
-}
-
+// 原来发送心跳只是为了与Follower建立连接且重置定时器
+// 现在发送心跳还用于追加统一日志
 func (cm *ConsensusModule) leaderSendHeartbeats() {
 	cm.mu.Lock()
 	if cm.state != Leader {
@@ -390,86 +286,82 @@ func (cm *ConsensusModule) leaderSendHeartbeats() {
 	for _, peerId := range cm.peerIds {
 		go func(peerId int) {
 			cm.mu.Lock()
-			ni := cm.nextIndex[peerId]
-			prevLogIndex := ni - 1
-			prevLogTerm := -1
-			if prevLogIndex >= 0 {
-				//peer的term应该与learder的term相同，term和index可以确定唯一位置
-				prevLogTerm = cm.log[prevLogIndex].Term
+			lastSameLogIndex := cm.nextIndex[peerId] - 1
+			lastSameLogTerm := -1
+			if lastSameLogIndex >= 0 {
+				lastSameLogTerm = cm.log[lastSameLogIndex].Term
 			}
-			//ni之前的所有内容都是需要追加的
-			entries := cm.log[ni:]
+			//主将相同日志后的所有内容都追加给从
+			entriesL2F := cm.log[lastSameLogIndex+1:]
 
 			args := AppendEntriesArgs{
-				Term:         savedCurrentTerm,
-				LeaderId:     cm.id,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      entries,
-				LeaderCommit: cm.commitIndex,
+				Term:             savedCurrentTerm,
+				LeaderId:         cm.id,
+				LastSameLogIndex: lastSameLogIndex,
+				LastSameLogTerm:  lastSameLogTerm,
+				Entries:          entriesL2F,
 			}
-			cm.mu.Unlock()
-			cm.dlog("sending AppendEntries to %v: ni=%d, arg=%+v", peerId, ni, args)
+			cm.dlog("sending AppendEntries to %v: ni=%d, args=%+v", peerId, 0, args)
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
-				defer cm.mu.Unlock()
-				if reply.Term > cm.currentTerm {
+				if reply.Term > savedCurrentTerm {
 					cm.dlog("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
 				}
-
 				if cm.state == Leader && savedCurrentTerm == reply.Term {
-					if reply.Success {
-						//ni起始到entries追加内容的长度
-						cm.nextIndex[peerId] = ni + len(entries)
-						//nextIndex的前一个就是match
-						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
-						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, matchIndex := %v", peerId, cm.nextIndex, cm.matchIndex)
+					//如果从节点返回错误，需要回退相同坐标
+					//如果从节点返回正确，表示通过一致性检测并且已经同步坐标
+					if !reply.Success {
+						//lastSameLogIndex是相同位置，+1是即将插入，-1是即将插入回退
+						cm.nextIndex[peerId] = (lastSameLogIndex + 1) - 1
+					} else {
+						//更新nextIndex
+						cm.nextIndex[peerId] = lastSameLogIndex + len(entriesL2F) + 1
 
+						//进行第二个阶段，对majority进行commit
 						savedCommitIndex := cm.commitIndex
-						//commitIndex为大多数节点都已经match的log
-						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-							if cm.log[i].Term == cm.currentTerm {
-								matchCount := 1
+						//查看commitIndex后续所有日志的同步情况
+						for needCommitIndex := savedCommitIndex + 1; needCommitIndex < len(cm.log); needCommitIndex++ {
+							//QA 为什么需要是相同的任期
+							if cm.log[needCommitIndex].Term == cm.currentTerm {
+								//统计数量
+								count := 1
 								for _, peerId := range cm.peerIds {
-									if cm.matchIndex[peerId] >= i {
-										matchCount++
+									if cm.nextIndex[peerId] >= needCommitIndex {
+										count++
 									}
 								}
-								if matchCount*2 > len(cm.peerIds)+1 {
-									cm.commitIndex = i
+								if count*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = needCommitIndex
 								}
 							}
 						}
+						//commitIndex更新后，需要进行消息同步
 						if cm.commitIndex != savedCommitIndex {
-							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
 							cm.newCommitReadyChan <- struct{}{}
 						}
-					} else {
-						cm.nextIndex[peerId] = ni - 1
-						cm.dlog("AppendEntries reply from %d !success: nextIndex := %d", peerId, ni-1)
 					}
 				}
 			}
+			cm.mu.Unlock()
 		}(peerId)
 	}
 }
 
+// 独立协程负责反馈commit,即返回lastApplied到commit这段内容全部返回
 func (cm *ConsensusModule) commitChanSender() {
 	for range cm.newCommitReadyChan {
 		cm.mu.Lock()
 		savedTerm := cm.currentTerm
 		savedLastApplied := cm.lastApplied
 		var entries []LogEntry
-		if cm.commitIndex > cm.lastApplied {
-			//QA why commitIndex need to plus 1?
-			entries = cm.log[cm.lastApplied+1 : cm.commitIndex+1]
+		if cm.commitIndex > savedLastApplied {
+			entries = cm.log[savedLastApplied:cm.commitIndex]
 			cm.lastApplied = cm.commitIndex
 		}
 		cm.mu.Unlock()
-		cm.dlog("commitChanSender entries=%v, savedLastApplied=%d", entries, savedLastApplied)
 
 		for i, entry := range entries {
 			cm.commitChan <- CommitEntry{
@@ -479,15 +371,130 @@ func (cm *ConsensusModule) commitChanSender() {
 			}
 		}
 	}
-	cm.dlog("commitChanSender done")
 }
 
-// dlog logs a debugging message is DebugCM > 0.
+type AppendEntriesArgs struct {
+	Term     int
+	LeaderId int
+
+	LastSameLogIndex int
+	LastSameLogTerm  int
+	Entries          []LogEntry
+	LeaderCommit     int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+// 为什么不需要Index
+type LogEntry struct {
+	Command interface{}
+	Term    int
+}
+
+type RequestVoteArgs struct {
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	Term int
+	//标记有无投票
+	VoteGranted bool
+}
+
+// DebugCM>0 则打debug日志
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	if DebugCM > 0 {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
 	}
+}
+
+// AppendEntries会注册为rpc方法，leader发送拉票请求后会调用该方法
+func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("AppendEntries: %+v", args)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in AppendEntries")
+		cm.becomeFollower(args.Term)
+	}
+
+	reply.Success = false
+	if args.Term == cm.currentTerm {
+		if cm.state != Follower {
+			cm.becomeFollower(args.Term)
+		}
+		cm.electionResetEvent = time.Now()
+
+		if args.LastSameLogIndex == -1 ||
+			args.LastSameLogIndex <= len(cm.log) && cm.log[args.LastSameLogIndex].Term == args.LastSameLogTerm {
+			//返回true表示已经通过一致性检测，可以进行日志追加
+			reply.Success = true
+			//只有当lastSameLogIndex指向的日志匹配，才返回true。
+			insertIndexFromL := args.LastSameLogIndex + 1
+			//追加
+			cm.log = append(cm.log[:insertIndexFromL], args.Entries...)
+		}
+
+		//判断commit是否更新
+		if args.LeaderCommit > cm.commitIndex {
+			cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
+			cm.newCommitReadyChan <- struct{}{}
+		}
+
+	}
+
+	reply.Term = cm.currentTerm
+	cm.dlog("AppendEntries reply: %+v", *reply)
+	return nil
+}
+
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.state == Dead {
+		return nil
+	}
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d]", args, cm.currentTerm, cm.votedFor)
+
+	if args.Term > cm.currentTerm {
+		cm.dlog("... term out of date in RequestVote")
+		cm.becomeFollower(args.Term)
+	}
+
+	if cm.currentTerm == args.Term && (cm.votedFor == -1 || cm.votedFor == args.CandidateId) {
+		reply.VoteGranted = true
+		cm.votedFor = args.CandidateId
+		cm.electionResetEvent = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+	reply.Term = cm.currentTerm
+	cm.dlog("... RequestVote reply: %+v", reply)
+	return nil
+}
+
+func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.id, cm.currentTerm, cm.state == Leader
+}
+
+func (cm *ConsensusModule) Stop() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.state = Dead
+	cm.dlog("becomes Dead")
 }
 
 func intMin(a, b int) int {
