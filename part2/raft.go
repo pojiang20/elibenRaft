@@ -415,7 +415,7 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	}
 }
 
-// TODO 没搞懂，这是作为接收者接收到的appendentries吗？
+// AppendEntries会注册为rpc方法，leader发送拉票请求后会调用该方法
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -435,7 +435,23 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 			cm.becomeFollower(args.Term)
 		}
 		cm.electionResetEvent = time.Now()
-		reply.Success = true
+
+		if args.LastSameLogIndex == -1 ||
+			args.LastSameLogIndex <= len(cm.log) && cm.log[args.LastSameLogIndex].Term == args.LastSameLogTerm {
+			//返回true表示已经通过一致性检测，可以进行日志追加
+			reply.Success = true
+			//只有当lastSameLogIndex指向的日志匹配，才返回true。
+			insertIndexFromL := args.LastSameLogIndex + 1
+			//追加
+			cm.log = append(cm.log[:insertIndexFromL], args.Entries...)
+		}
+
+		//判断commit是否更新
+		if args.LeaderCommit > cm.commitIndex {
+			cm.commitIndex = intMin(args.LeaderCommit, len(cm.log)-1)
+			cm.newCommitReadyChan <- struct{}{}
+		}
+
 	}
 
 	reply.Term = cm.currentTerm
@@ -479,4 +495,11 @@ func (cm *ConsensusModule) Stop() {
 	defer cm.mu.Unlock()
 	cm.state = Dead
 	cm.dlog("becomes Dead")
+}
+
+func intMin(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
